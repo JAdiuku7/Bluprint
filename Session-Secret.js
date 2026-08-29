@@ -9,7 +9,7 @@ function generateSecret() {
     }
     if (process.env.NODE_ENV === 'production') {
         throw new Error('SESSION_SECRET environment variable must be set in production' +
-            'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"
+            'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
         );
     }
     if (fs.existsSync(SECRET_FILE)) {
