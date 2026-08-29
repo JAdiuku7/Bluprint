@@ -3,13 +3,6 @@
 //
 // Usage: DATABASE_URL=postgres://... node db/migrate-from-json.js
 //
-// IMPORTANT: I don't have your actual data.json in front of me, so this
-// assumes a shape like:
-//   { users: { "<id>": { auth: { email, salt, hash }, profile: {},
-//                          savedJobs: [...], applications: [...] } } }
-// Adjust the field paths below (raw.users, user.auth, user.savedJobs,
-// user.applications) to match your real structure before running this.
-
 const fs = require('fs');
 const path = require('path');
 const pool = require('./Pool');

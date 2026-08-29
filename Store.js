@@ -2,8 +2,13 @@
 // data.json reads/writes — route handlers should call these functions
 // instead of touching the file system directly.
 
-const pool = require('./pool');
+const pool = require('./Pool');
 
+function toProfile(row) {
+    return row.profile || {};
+}
+
+// ----Users ---------------------------------------
 async function findUserByEmail(email) {
     const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     return rows[0] || null;
@@ -14,9 +19,10 @@ async function findUserById(id) {
     return rows[0] || null;
 }
 
-async function createUser({ email, salt, hash }) {
+async function createUser({ id, email, passwordSalt, passwordHash, profile }) {
     const { rows } = await pool.query(
-        'INSERT INTO users (email, salt, hash) VALUES ($1, $2, $3) RETURNING *', [email, salt, hash]
+        `INSERT INTO users (id, email, password_salt, password_hash, profile)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`, [id, email, passwordSalt, passwordHash, JSON.stringify(profile)]
     );
     return rows[0];
 }
@@ -27,7 +33,7 @@ async function updateProfile(userId, profile) {
     );
     return rows[0];
 }
-
+//--------- Saved Jobs ---------------------------------------
 async function saveJob(userId, jobId, jobData) {
     const { rows } = await pool.query(
         `INSERT INTO saved_jobs (user_id, job_id, job_data)
@@ -45,11 +51,11 @@ async function unsaveJob(userId, jobId) {
     ]);
 }
 
-async function getSavedJobs(userId) {
+async function getSavedJobIds(userId) {
     const { rows } = await pool.query(
-        'SELECT * FROM saved_jobs WHERE user_id = $1 ORDER BY saved_at DESC', [userId]
+        'SELECT job_id FROM saved_jobs WHERE user_id = $1 ORDER BY saved_at DESC', [userId]
     );
-    return rows;
+    return rows.map((r) => r.job_id);
 }
 
 async function createApplication(userId, jobId, jobData) {
