@@ -12,7 +12,6 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = process.env.PORT || 4000;
-const DB_FILE = path.join(__dirname, "data.json");
 const SECRET_FILE = path.join(__dirname, ".session-secret");
 const SYNC_INTERVAL_MS = 60000; // re-fetch company boards at most this often
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // sessions last 30 days
@@ -209,43 +208,13 @@ async function refreshJobCache() {
 }
 
 // ---------------------------------------------------------------
-// Tiny JSON-file "database" for per-user data
-// Shape: {
-//   users: { [userId]: { auth: { email, passwordHash, passwordSalt }, profile, savedJobIds, alerts, applications } },
-//   emailIndex: { [lowercasedEmail]: userId }
-// }
+// Per-user data now lives in Postgres (see db/store.js) instead of
+// a flat data.json file — that file wasn't safe for concurrent
+// writes and wouldn't survive a redeploy on most hosts.
 // ---------------------------------------------------------------
-function loadDb() {
-    try {
-        const db = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-        if (!db.emailIndex) db.emailIndex = {};
-        return db;
-    } catch (err) {
-        return { users: {}, emailIndex: {} };
-    }
-}
+const store = require("./db/store");
 
-function saveDb(db) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
-
-function getUser(db, userId) {
-    if (!db.users[userId]) {
-        db.users[userId] = {
-            auth: null,
-            profile: { name: "", email: "", phone: "", headline: "", location: "", resumeUrl: "", skills: "" },
-            savedJobIds: [],
-            alerts: [],
-            applications: [],
-        };
-    }
-    return db.users[userId];
-}
-
-// Never send password hash/salt to the client.
-function publicProfile(user) {
-    return user.profile;
-}
+const EMPTY_PROFILE = { name: "", email: "", phone: "", headline: "", location: "", resumeUrl: "", skills: "" };
 
 // ---------------------------------------------------------------
 // Express app
@@ -269,51 +238,46 @@ function requireAuth(req, res, next) {
 }
 
 // ---- Auth: signup ----
-app.post("/api/auth/signup", (req, res) => {
+app.post("/api/auth/signup", async(req, res) => {
     const { email, password, name } = req.body || {};
     if (!email || !EMAIL_RE.test(String(email))) return res.status(400).json({ error: "Enter a valid email address" });
     if (!password || String(password).length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
 
     const normalizedEmail = String(email).trim().toLowerCase();
-    const db = loadDb();
-    if (db.emailIndex[normalizedEmail]) return res.status(409).json({ error: "An account with that email already exists" });
+    const existing = await store.findUserByEmail(normalizedEmail);
+    if (existing) return res.status(409).json({ error: "An account with that email already exists" });
 
     const userId = crypto.randomUUID();
     const { salt, hash } = hashPassword(password);
-    const user = getUser(db, userId);
-    user.auth = { email: normalizedEmail, passwordSalt: salt, passwordHash: hash };
-    user.profile.email = normalizedEmail;
-    if (name) user.profile.name = String(name).trim();
-    db.emailIndex[normalizedEmail] = userId;
-    saveDb(db);
+    const profile = {...EMPTY_PROFILE, email: normalizedEmail };
+    if (name) profile.name = String(name).trim();
+    const user = await store.createUser({ id: userId, email: normalizedEmail, passwordSalt: salt, passwordHash: hash, profile });
 
-    res.status(201).json({ userId, token: signToken(userId), profile: publicProfile(user) });
+    res.status(201).json({ userId, token: signToken(userId), profile: store.toProfile(user) });
 });
 
 // ---- Auth: login ----
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", async(req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
 
     const normalizedEmail = String(email).trim().toLowerCase();
-    const db = loadDb();
-    const userId = db.emailIndex[normalizedEmail];
-    const user = userId ? db.users[userId] : null;
+    const user = await store.findUserByEmail(normalizedEmail);
 
     // Same generic error whether the email is unknown or the password is
     // wrong, so a caller can't use this endpoint to enumerate accounts.
-    if (!user || !user.auth || !verifyPassword(password, user.auth.passwordSalt, user.auth.passwordHash)) {
+    if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) {
         return res.status(401).json({ error: "Incorrect email or password" });
     }
 
-    res.json({ userId, token: signToken(userId), profile: publicProfile(user) });
+    res.json({ userId: user.id, token: signToken(user.id), profile: store.toProfile(user) });
 });
 
 // ---- Auth: who am I (used by the frontend to validate a stored token) ----
-app.get("/api/auth/me", requireAuth, (req, res) => {
-    const db = loadDb();
-    const user = getUser(db, req.userId);
-    res.json({ userId: req.userId, profile: publicProfile(user) });
+app.get("/api/auth/me", requireAuth, async(req, res) => {
+    const user = await store.findUserById(req.userId);
+    if (!user) return res.status(401).json({ error: "Not authenticated" });
+    res.json({ userId: req.userId, profile: store.toProfile(user) });
 });
 
 // ---- Jobs (public, no user scoping needed) ----
@@ -329,85 +293,67 @@ app.post("/api/jobs/refresh", async(req, res) => {
 });
 
 // ---- Profile ----
-app.get("/api/profile", requireAuth, (req, res) => {
-    const db = loadDb();
-    res.json(getUser(db, req.userId).profile);
+app.get("/api/profile", requireAuth, async(req, res) => {
+    const user = await store.findUserById(req.userId);
+    res.json(store.toProfile(user));
 });
 
-app.put("/api/profile", requireAuth, (req, res) => {
-    const db = loadDb();
-    const user = getUser(db, req.userId);
-    // Email is the account identifier (tied to emailIndex + login) — it's
-    // not editable through the general profile form. A real app would
-    // offer a dedicated "change email" flow with re-verification.
+app.put("/api/profile", requireAuth, async(req, res) => {
+    // Email is the account identifier (tied to the users table + login) —
+    // it's not editable through the general profile form. A real app
+    // would offer a dedicated "change email" flow with re-verification.
     const { email, ...editableFields } = req.body || {};
-    user.profile = {...user.profile, ...editableFields };
-    saveDb(db);
-    res.json(publicProfile(user));
+    const user = await store.findUserById(req.userId);
+    const updatedProfile = {...store.toProfile(user), ...editableFields };
+    const saved = await store.updateProfile(req.userId, updatedProfile);
+    res.json(store.toProfile(saved));
 });
 
 // ---- Saved jobs ----
-app.get("/api/saved", requireAuth, (req, res) => {
-    const db = loadDb();
-    res.json(getUser(db, req.userId).savedJobIds);
+app.get("/api/saved", requireAuth, async(req, res) => {
+    res.json(await store.getSavedJobIds(req.userId));
 });
 
-app.post("/api/saved", requireAuth, (req, res) => {
+app.post("/api/saved", requireAuth, async(req, res) => {
     const { jobId } = req.body;
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
-    const db = loadDb();
-    const user = getUser(db, req.userId);
-    if (!user.savedJobIds.includes(jobId)) user.savedJobIds.push(jobId);
-    saveDb(db);
-    res.json(user.savedJobIds);
+    await store.addSavedJob(req.userId, jobId);
+    res.json(await store.getSavedJobIds(req.userId));
 });
 
-app.delete("/api/saved/:jobId", requireAuth, (req, res) => {
-    const db = loadDb();
-    const user = getUser(db, req.userId);
-    user.savedJobIds = user.savedJobIds.filter((id) => id !== req.params.jobId);
-    saveDb(db);
-    res.json(user.savedJobIds);
+app.delete("/api/saved/:jobId", requireAuth, async(req, res) => {
+    await store.removeSavedJob(req.userId, req.params.jobId);
+    res.json(await store.getSavedJobIds(req.userId));
 });
 
 // ---- Alerts ----
-app.get("/api/alerts", requireAuth, (req, res) => {
-    const db = loadDb();
-    res.json(getUser(db, req.userId).alerts);
+app.get("/api/alerts", requireAuth, async(req, res) => {
+    res.json(await store.getAlerts(req.userId));
 });
 
-app.post("/api/alerts", requireAuth, (req, res) => {
+app.post("/api/alerts", requireAuth, async(req, res) => {
     const { name, query } = req.body;
     if (!name || !query) return res.status(400).json({ error: "name and query are required" });
-    const db = loadDb();
-    const user = getUser(db, req.userId);
     const alert = { id: `AL-${Date.now()}`, name, query, createdAt: new Date().toISOString() };
-    user.alerts.unshift(alert);
-    saveDb(db);
-    res.json(user.alerts);
+    await store.addAlert(req.userId, alert);
+    res.json(await store.getAlerts(req.userId));
 });
 
-app.delete("/api/alerts/:id", requireAuth, (req, res) => {
-    const db = loadDb();
-    const user = getUser(db, req.userId);
-    user.alerts = user.alerts.filter((a) => a.id !== req.params.id);
-    saveDb(db);
-    res.json(user.alerts);
+app.delete("/api/alerts/:id", requireAuth, async(req, res) => {
+    await store.removeAlert(req.userId, req.params.id);
+    res.json(await store.getAlerts(req.userId));
 });
 
 // ---- Applications (Quick Apply logs + manual tracker entries) ----
-app.get("/api/applications", requireAuth, (req, res) => {
-    const db = loadDb();
-    res.json(getUser(db, req.userId).applications);
+app.get("/api/applications", requireAuth, async(req, res) => {
+    res.json(await store.getApplications(req.userId));
 });
 
-app.post("/api/applications", requireAuth, (req, res) => {
+app.post("/api/applications", requireAuth, async(req, res) => {
     const { jobId, jobTitle, company, name, email, phone, link, note } = req.body;
     if (!jobId || !jobTitle || !company) {
         return res.status(400).json({ error: "jobId, jobTitle, and company are required" });
     }
-    const db = loadDb();
-    const user = getUser(db, req.userId);
     const record = {
         ref: `APP-${Math.floor(1000 + Math.random() * 9000)}`,
         jobId,
@@ -420,8 +366,7 @@ app.post("/api/applications", requireAuth, (req, res) => {
         link: link || "",
         note: note || "",
     };
-    user.applications.unshift(record);
-    saveDb(db);
+    await store.addApplication(req.userId, record);
     res.json(record);
 });
 
@@ -457,10 +402,10 @@ refreshJobCache().then(() => {
  *    instead of a trusted x-user-id header, but there's no
  *    "verify your email" step and no forgot-password flow yet.
  *
- * 2. A real database. data.json works for a demo but isn't safe
- *    for concurrent writes at any real scale — move to Postgres/
- *    SQLite/etc. (e.g. via Prisma) once this needs to handle
- *    more than a handful of users.
+ * 2. [DONE] Per-user data now lives in Postgres (db/store.js) instead
+ *    of data.json. Run db/schema.sql once against your database, and
+ *    db/migrate-from-json.js once if you have existing local users
+ *    to carry over.
  *
  * 3. Rate limiting / abuse protection on the auth endpoints in
  *    particular (login attempts, signup spam).

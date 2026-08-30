@@ -1,8 +1,9 @@
-// One-time migration: reads the old flat-file data.json and inserts
-// its contents into Postgres. Run once, then retire data.json.
+// One-time migration: reads the existing data.json and loads it into
+// Postgres. Run once, then you can delete data.json and .session-secret's
+// dependency on it goes away too (separate blocker).
 //
 // Usage: DATABASE_URL=postgres://... node db/migrate-from-json.js
-//
+
 const fs = require('fs');
 const path = require('path');
 const pool = require('./Pool');
@@ -21,42 +22,67 @@ async function migrate() {
 
     console.log(`Found ${userIds.length} users to migrate.`);
 
-    for (const oldId of userIds) {
-        const user = users[oldId];
+    for (const userId of userIds) {
+        const user = users[userId];
 
         if (!user.auth || !user.auth.email) {
-            console.warn(`Skipping user ${oldId}: missing auth data`);
+            console.warn(`Skipping ${userId}: no auth data (never completed signup)`);
             continue;
         }
 
         const { rows } = await pool.query(
-            `INSERT INTO users (email, salt, hash, profile)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (email) DO NOTHING
-       RETURNING id`, [user.auth.email, user.auth.salt, user.auth.hash, JSON.stringify(user.profile || {})]
+            `INSERT INTO users (id, email, password_salt, password_hash, profile)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO NOTHING
+       RETURNING id`, [
+                userId,
+                user.auth.email,
+                user.auth.passwordSalt,
+                user.auth.passwordHash,
+                JSON.stringify(user.profile || {}),
+            ]
         );
 
-        const newUserId = rows[0] && rows[0].id;
-        if (!newUserId) {
+        if (!rows[0]) {
             console.warn(`User ${user.auth.email} already exists in Postgres — skipping related data.`);
             continue;
         }
 
-        for (const job of user.savedJobs || []) {
+        for (const jobId of user.savedJobIds || []) {
             await pool.query(
-                `INSERT INTO saved_jobs (user_id, job_id, job_data)
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, [newUserId, job.id, JSON.stringify(job)]
+                `INSERT INTO saved_jobs (user_id, job_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [userId, jobId]
+            );
+        }
+
+        for (const alert of user.alerts || []) {
+            await pool.query(
+                `INSERT INTO alerts (id, user_id, name, query, created_at)
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, [alert.id, userId, alert.name, JSON.stringify(alert.query), alert.createdAt]
             );
         }
 
         for (const app of user.applications || []) {
             await pool.query(
-                `INSERT INTO applications (user_id, job_id, job_data, status)
-         VALUES ($1, $2, $3, $4)`, [newUserId, app.jobId || app.id, JSON.stringify(app), app.status || 'applied']
+                `INSERT INTO applications
+          (ref, user_id, job_id, job_title, company, submitted, name, email, phone, link, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT DO NOTHING`, [
+                    app.ref,
+                    userId,
+                    app.jobId,
+                    app.jobTitle,
+                    app.company,
+                    app.submitted,
+                    app.name || '',
+                    app.email || '',
+                    app.phone || '',
+                    app.link || '',
+                    app.note || '',
+                ]
             );
         }
 
-        console.log(`Migrated ${user.auth.email}`);
+        console.log(`Migrated ${user.auth.email} (${(user.savedJobIds || []).length} saved, ${(user.alerts || []).length} alerts, ${(user.applications || []).length} applications)`);
     }
 
     console.log('Migration complete.');

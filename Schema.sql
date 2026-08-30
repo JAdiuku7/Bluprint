@@ -1,40 +1,48 @@
 -- Bluprint Postgres schema
--- Run once against your database: psql $DATABASE_URL -f db/schema.sql
+-- Apply once: psql $DATABASE_URL -f db/schema.sql
 
 CREATE TABLE IF NOT EXISTS users (
-  id SERIAL PRIMARY KEY,
+  id UUID PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
-  salt TEXT NOT NULL,
-  hash TEXT NOT NULL,
-  profile JSONB DEFAULT '{}'::jsonb,
+  password_salt TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  profile JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
 
+-- Saved jobs are just an (user, jobId) pairing — the job data itself
+-- lives in the in-memory jobCache / live Greenhouse+Lever APIs, not here.
 CREATE TABLE IF NOT EXISTS saved_jobs (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   job_id TEXT NOT NULL,
-  job_data JSONB NOT NULL,
   saved_at TIMESTAMPTZ DEFAULT now(),
-  UNIQUE (user_id, job_id)
+  PRIMARY KEY (user_id, job_id)
 );
+
+CREATE TABLE IF NOT EXISTS alerts (
+  id TEXT PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  query JSONB NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_user ON alerts (user_id);
 
 CREATE TABLE IF NOT EXISTS applications (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ref TEXT PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   job_id TEXT NOT NULL,
-  job_data JSONB NOT NULL,
-  status TEXT DEFAULT 'applied',
-  applied_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
+  job_title TEXT NOT NULL,
+  company TEXT NOT NULL,
+  submitted TIMESTAMPTZ NOT NULL,
+  name TEXT DEFAULT '',
+  email TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  link TEXT DEFAULT '',
+  note TEXT DEFAULT ''
 );
 
-CREATE TABLE IF NOT EXISTS job_alerts (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  criteria JSONB NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  active BOOLEAN DEFAULT true
-);
+CREATE INDEX IF NOT EXISTS idx_applications_user ON applications (user_id);
