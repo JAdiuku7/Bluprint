@@ -3,6 +3,7 @@
 // rows it needs, instead of reading and rewriting one giant file.
 
 const pool = require('./Pool');
+const crypto = require('crypto');
 
 function toProfile(row) {
     return row.profile || {};
@@ -32,6 +33,42 @@ async function updateProfile(userId, profile) {
         'UPDATE users SET profile = $2 WHERE id = $1 RETURNING *', [userId, JSON.stringify(profile)]
     );
     return rows[0];
+}
+
+async function updatePassword(userId, passwordSalt, passwordHash) {
+    await pool.query(
+        'UPDATE users SET password_salt = $2, password_hash = $3 WHERE id = $1', [userId, passwordSalt, passwordHash]
+    );
+}
+
+async function setEmailVerified(userId) {
+    await pool.query('UPDATE users SET email_verified = true WHERE id = $1', [userId]);
+}
+
+// ---- Auth tokens (email verification + password reset) --------------
+async function createAuthToken(userId, type, ttlMs) {
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + ttlMs);
+    await pool.query(
+        'INSERT INTO auth_tokens (token, user_id, type, expires_at) VALUES ($1, $2, $3, $4)', [token, userId, type, expiresAt]
+    );
+    return token;
+}
+
+// Looks up a token, and if it's valid (right type, unused, unexpired),
+// marks it used and returns the associated userId. Returns null for
+// anything invalid, already-used, or expired — callers shouldn't
+// distinguish between these cases in their error message, since that
+// would leak information about which tokens exist.
+async function consumeAuthToken(token, type) {
+    const { rows } = await pool.query(
+        `SELECT * FROM auth_tokens
+     WHERE token = $1 AND type = $2 AND used_at IS NULL AND expires_at > now()`, [token, type]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    await pool.query('UPDATE auth_tokens SET used_at = now() WHERE token = $1', [token]);
+    return row.user_id;
 }
 
 // ---- Saved jobs ----------------------------------------------------
@@ -124,6 +161,10 @@ module.exports = {
     findUserById,
     createUser,
     updateProfile,
+    updatePassword,
+    setEmailVerified,
+    createAuthToken,
+    consumeAuthToken,
     getSavedJobIds,
     addSavedJob,
     removeSavedJob,
