@@ -10,12 +10,21 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 
 const PORT = process.env.PORT || 4000;
 const SECRET_FILE = path.join(__dirname, ".session-secret");
 const SYNC_INTERVAL_MS = 60000; // re-fetch company boards at most this often
-const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // sessions last 30 days
+const TOKEN_TTL_MS = Number(process.env.TOKEN_TTL_MS) || 30 * 24 * 60 * 60 * 1000; // sessions last 30 days by default — consider shortening (e.g. 7 days) for production
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Comma-separated list of allowed frontend origins, e.g.
+// "https://bluprint.app,https://www.bluprint.app". Falls back to the
+// local Vite dev server so `npm run dev` keeps working unconfigured.
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || "http://localhost:5173")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
 
 // ---------------------------------------------------------------
 // Live job sources — same real companies used in the frontend
@@ -62,11 +71,28 @@ function timeAgo(dateStr) {
 // external library needed for a project this size).
 // ---------------------------------------------------------------
 function loadOrCreateSessionSecret() {
+    if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+
+    if (process.env.NODE_ENV === "production") {
+        throw new Error(
+            "SESSION_SECRET environment variable is required in production. " +
+            "Generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+        );
+    }
+
+    // Local dev fallback only: persist a generated secret to disk so
+    // sessions survive server restarts. Never relied on in production —
+    // most hosts wipe the filesystem on every redeploy, which would
+    // silently invalidate every active session token.
     try {
         return fs.readFileSync(SECRET_FILE, "utf8").trim();
     } catch (err) {
         const secret = crypto.randomBytes(32).toString("hex");
         fs.writeFileSync(SECRET_FILE, secret);
+        console.warn(
+            "[auth] No SESSION_SECRET set — generated a dev-only secret at .session-secret. " +
+            "Set SESSION_SECRET in your environment before deploying."
+        );
         return secret;
     }
 }
@@ -213,14 +239,24 @@ async function refreshJobCache() {
 // writes and wouldn't survive a redeploy on most hosts.
 // ---------------------------------------------------------------
 const store = require("./db/store");
+const email = require("./lib/email");
 
 const EMPTY_PROFILE = { name: "", email: "", phone: "", headline: "", location: "", resumeUrl: "", skills: "" };
+const EMAIL_VERIFY_TTL_MS = 24 * 60 * 60 * 1000; // verification links last 24 hours
+const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000; // reset links last 1 hour
 
 // ---------------------------------------------------------------
 // Express app
 // ---------------------------------------------------------------
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin(origin, callback) {
+        // Allow tools with no Origin header (curl, server-to-server health
+        // checks) and any origin explicitly present in CORS_ORIGINS.
+        if (!origin || CORS_ORIGINS.includes(origin)) return callback(null, true);
+        callback(new Error(`Origin ${origin} is not allowed by CORS`));
+    },
+}));
 app.use(express.json());
 
 // Every request after this point is scoped to a user via a signed
@@ -237,13 +273,27 @@ function requireAuth(req, res, next) {
     next();
 }
 
+// scrypt is deliberately slow (that's what makes it resistant to
+// brute-forcing password hashes), which cuts both ways: it also makes
+// each login/signup attempt expensive for this server to compute. These
+// limits stop someone from burning CPU or credential-stuffing accounts
+// by hammering the auth endpoints. Keyed by IP, since there's no user
+// identity yet at this point in the request.
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: Number(process.env.AUTH_RATE_LIMIT_MAX) || 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many attempts. Please wait a few minutes and try again." },
+});
+
 // ---- Auth: signup ----
-app.post("/api/auth/signup", async(req, res) => {
-    const { email, password, name } = req.body || {};
-    if (!email || !EMAIL_RE.test(String(email))) return res.status(400).json({ error: "Enter a valid email address" });
+app.post("/api/auth/signup", authLimiter, async(req, res) => {
+    const { email: rawEmail, password, name } = req.body || {};
+    if (!rawEmail || !EMAIL_RE.test(String(rawEmail))) return res.status(400).json({ error: "Enter a valid email address" });
     if (!password || String(password).length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
 
-    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedEmail = String(rawEmail).trim().toLowerCase();
     const existing = await store.findUserByEmail(normalizedEmail);
     if (existing) return res.status(409).json({ error: "An account with that email already exists" });
 
@@ -253,15 +303,24 @@ app.post("/api/auth/signup", async(req, res) => {
     if (name) profile.name = String(name).trim();
     const user = await store.createUser({ id: userId, email: normalizedEmail, passwordSalt: salt, passwordHash: hash, profile });
 
-    res.status(201).json({ userId, token: signToken(userId), profile: store.toProfile(user) });
+    // Don't let a flaky email provider block account creation — log and
+    // move on. The user can request another verification email later.
+    try {
+        const verifyToken = await store.createAuthToken(userId, "verify_email", EMAIL_VERIFY_TTL_MS);
+        await email.verificationEmail(normalizedEmail, verifyToken);
+    } catch (err) {
+        console.error("Failed to send verification email:", err.message);
+    }
+
+    res.status(201).json({ userId, token: signToken(userId), profile: store.toProfile(user), emailVerified: false });
 });
 
 // ---- Auth: login ----
-app.post("/api/auth/login", async(req, res) => {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+app.post("/api/auth/login", authLimiter, async(req, res) => {
+    const { email: rawEmail, password } = req.body || {};
+    if (!rawEmail || !password) return res.status(400).json({ error: "Email and password are required" });
 
-    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedEmail = String(rawEmail).trim().toLowerCase();
     const user = await store.findUserByEmail(normalizedEmail);
 
     // Same generic error whether the email is unknown or the password is
@@ -270,14 +329,77 @@ app.post("/api/auth/login", async(req, res) => {
         return res.status(401).json({ error: "Incorrect email or password" });
     }
 
-    res.json({ userId: user.id, token: signToken(user.id), profile: store.toProfile(user) });
+    res.json({ userId: user.id, token: signToken(user.id), profile: store.toProfile(user), emailVerified: user.email_verified });
 });
 
 // ---- Auth: who am I (used by the frontend to validate a stored token) ----
 app.get("/api/auth/me", requireAuth, async(req, res) => {
     const user = await store.findUserById(req.userId);
     if (!user) return res.status(401).json({ error: "Not authenticated" });
-    res.json({ userId: req.userId, profile: store.toProfile(user) });
+    res.json({ userId: req.userId, profile: store.toProfile(user), emailVerified: user.email_verified });
+});
+
+// ---- Auth: verify email ----
+app.post("/api/auth/verify-email", async(req, res) => {
+    const { token } = req.body || {};
+    if (!token) return res.status(400).json({ error: "token is required" });
+    const userId = await store.consumeAuthToken(token, "verify_email");
+    if (!userId) return res.status(400).json({ error: "This verification link is invalid or has expired" });
+    await store.setEmailVerified(userId);
+    res.json({ ok: true });
+});
+
+// ---- Auth: resend verification email ----
+app.post("/api/auth/resend-verification", authLimiter, requireAuth, async(req, res) => {
+    const user = await store.findUserById(req.userId);
+    if (!user) return res.status(401).json({ error: "Not authenticated" });
+    if (user.email_verified) return res.json({ ok: true, alreadyVerified: true });
+
+    const verifyToken = await store.createAuthToken(user.id, "verify_email", EMAIL_VERIFY_TTL_MS);
+    try {
+        await email.verificationEmail(user.email, verifyToken);
+    } catch (err) {
+        console.error("Failed to send verification email:", err.message);
+        return res.status(502).json({ error: "Couldn't send the verification email — please try again shortly" });
+    }
+    res.json({ ok: true });
+});
+
+// ---- Auth: forgot password ----
+app.post("/api/auth/forgot-password", authLimiter, async(req, res) => {
+    const { email: rawEmail } = req.body || {};
+    if (!rawEmail) return res.status(400).json({ error: "email is required" });
+
+    const normalizedEmail = String(rawEmail).trim().toLowerCase();
+    const user = await store.findUserByEmail(normalizedEmail);
+
+    // Always respond the same way regardless of whether the account
+    // exists, so this endpoint can't be used to enumerate registered
+    // emails. Only send the actual email if there IS a matching account.
+    if (user) {
+        try {
+            const resetToken = await store.createAuthToken(user.id, "reset_password", PASSWORD_RESET_TTL_MS);
+            await email.passwordResetEmail(user.email, resetToken);
+        } catch (err) {
+            console.error("Failed to send password reset email:", err.message);
+        }
+    }
+
+    res.json({ ok: true, message: "If an account with that email exists, a reset link has been sent." });
+});
+
+// ---- Auth: reset password ----
+app.post("/api/auth/reset-password", authLimiter, async(req, res) => {
+    const { token, password } = req.body || {};
+    if (!token || !password) return res.status(400).json({ error: "token and password are required" });
+    if (String(password).length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+    const userId = await store.consumeAuthToken(token, "reset_password");
+    if (!userId) return res.status(400).json({ error: "This reset link is invalid or has expired" });
+
+    const { salt, hash } = hashPassword(password);
+    await store.updatePassword(userId, salt, hash);
+    res.json({ ok: true });
 });
 
 // ---- Jobs (public, no user scoping needed) ----
@@ -397,23 +519,28 @@ refreshJobCache().then(() => {
  * ------------------------------------------------------------
  * What this backend does NOT do, and would need for production:
  *
- * 1. Email verification + password reset. Signup/login now use
- *    real hashed passwords (scrypt) and signed session tokens
- *    instead of a trusted x-user-id header, but there's no
- *    "verify your email" step and no forgot-password flow yet.
+ * 1. [DONE] Email verification and password reset are implemented
+ *    (see lib/email.js and the /api/auth/verify-email,
+ *    resend-verification, forgot-password, reset-password routes).
+ *    Set RESEND_API_KEY, FROM_EMAIL, and FRONTEND_URL to send real
+ *    emails — without RESEND_API_KEY it just logs to the console,
+ *    which is fine for local dev but not for production.
  *
  * 2. [DONE] Per-user data now lives in Postgres (db/store.js) instead
  *    of data.json. Run db/schema.sql once against your database, and
  *    db/migrate-from-json.js once if you have existing local users
  *    to carry over.
  *
- * 3. Rate limiting / abuse protection on the auth endpoints in
- *    particular (login attempts, signup spam).
+ * 3. [DONE] express-rate-limit caps /api/auth/signup and
+ *    /api/auth/login at AUTH_RATE_LIMIT_MAX attempts per IP per
+ *    15-minute window (default 20). Tune AUTH_RATE_LIMIT_MAX per
+ *    environment if it's too strict or too loose in practice.
  *
- * 4. HTTPS + environment-based CORS origin allowlist instead of
- *    the wide-open cors() default used here for local dev. Also
- *    consider rotating SESSION_SECRET and shortening TOKEN_TTL_MS
- *    for a real deployment — right now it's a 30-day token stored
- *    on disk in .session-secret.
+ * 4. [DONE] SESSION_SECRET now reads from the environment (required
+ *    in production, dev-only file fallback otherwise) and CORS is
+ *    restricted to an allowlist via CORS_ORIGIN instead of wide open.
+ *    Still worth doing before a real deploy: HTTPS at the hosting
+ *    layer (most PaaS providers handle this for you), and consider
+ *    shortening TOKEN_TTL_MS from the 30-day default.
  * ------------------------------------------------------------
  */

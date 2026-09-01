@@ -6,7 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const pool = require('./Pool');
+const pool = require('./backend/db/Pool');
 
 const DATA_FILE = path.join(__dirname, '..', 'data.json');
 
