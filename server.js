@@ -458,8 +458,8 @@ app.get("/api/health", (req, res) => {
 // Boot
 // ---------------------------------------------------------------
 refreshJobCache().then(() => {
-    app.listen(PORT, () => {
-        console.log(`Bluprint backend listening on http://localhost:${PORT}`);
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Bluprint backend listening on port ${PORT}`);
         console.log(`Job cache: ${jobCache.jobs.length} listings, status=${jobCache.status}`);
     });
 });
