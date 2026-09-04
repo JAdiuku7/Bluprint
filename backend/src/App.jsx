@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
-
+import { SpeedInsights } from "@vercel/speed-insights/next"
 // ---------------------------------------------------------------
 // Point this at wherever server.js is actually running. Locally
 // that's http://localhost:4000 by default; change it once you
