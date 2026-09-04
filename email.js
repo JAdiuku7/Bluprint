@@ -50,4 +50,4 @@ function passwordResetEmail(email, token) {
     });
 }
 
-module.exports = { sendEmail, verificationEmail, passwordResetEmail };
+export { sendEmail, verificationEmail, passwordResetEmail };

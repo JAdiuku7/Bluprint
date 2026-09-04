@@ -1,10 +1,4 @@
-/**
- * Run it:
- *   npm install
- *   node server.js
- *   -> listens on http://localhost:4000
- */
-
+require('dotenv').config();
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
@@ -239,7 +233,7 @@ async function refreshJobCache() {
 // writes and wouldn't survive a redeploy on most hosts.
 // ---------------------------------------------------------------
 const store = require("./db/store");
-const email = require("./lib/email");
+const email = require("../email");
 
 const EMPTY_PROFILE = { name: "", email: "", phone: "", headline: "", location: "", resumeUrl: "", skills: "" };
 const EMAIL_VERIFY_TTL_MS = 24 * 60 * 60 * 1000; // verification links last 24 hours
